@@ -1,27 +1,65 @@
+import os
 from pathlib import Path
 
 import streamlit as st
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-# Ruta principal del proyecto
+# ---------------------------------------------------------
+# Configuración general
+# ---------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
 
-# Ruta del documento PDF
 PDF_PATH = (
     BASE_DIR
     / "documentos"
-    / "marco_teorico_agenda_digital.pdf"
+    / "manual_onboarding_desarrolladores.pdf"
+)
+
+# Leer las variables guardadas en el archivo .env
+load_dotenv(BASE_DIR / ".env")
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash",
+)
+
+GEMINI_EMBEDDING_MODEL = os.getenv(
+    "GEMINI_EMBEDDING_MODEL",
+    "gemini-embedding-2",
 )
 
 
-def procesar_documento(ruta_pdf: Path):
+# ---------------------------------------------------------
+# Leer el PDF y crear la base vectorial
+# ---------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def crear_base_vectorial(
+    ruta_pdf: str,
+    fecha_modificacion: float,
+):
     """
-    Lee el PDF, elimina páginas vacías y divide
-    el contenido en fragmentos más pequeños.
+    Lee el PDF, extrae el texto, crea fragmentos,
+    genera embeddings y construye la base FAISS.
     """
-    loader = PyPDFLoader(str(ruta_pdf))
+
+    # Esta variable hace que Streamlit reconstruya
+    # la base cuando el PDF sea modificado.
+    del fecha_modificacion
+
+    loader = PyPDFLoader(ruta_pdf)
     paginas = loader.load()
 
     paginas_con_texto = [
@@ -29,6 +67,11 @@ def procesar_documento(ruta_pdf: Path):
         for pagina in paginas
         if pagina.page_content.strip()
     ]
+
+    if not paginas_con_texto:
+        raise ValueError(
+            "No se encontró texto legible en el PDF."
+        )
 
     divisor = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -39,8 +82,104 @@ def procesar_documento(ruta_pdf: Path):
         paginas_con_texto
     )
 
-    return paginas_con_texto, fragmentos
+    # Convierte cada fragmento en un vector numérico.
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=GEMINI_EMBEDDING_MODEL,
+    )
 
+    # Guarda los vectores para realizar búsquedas.
+    base_vectorial = FAISS.from_documents(
+        fragmentos,
+        embeddings,
+    )
+
+    return paginas_con_texto, fragmentos, base_vectorial
+
+
+# ---------------------------------------------------------
+# Buscar información y generar la respuesta
+# ---------------------------------------------------------
+
+def responder_pregunta(
+    pregunta: str,
+    base_vectorial: FAISS,
+):
+    """
+    Busca los fragmentos más relacionados con la pregunta
+    y solicita a Gemini una respuesta basada en ellos.
+    """
+
+    documentos_encontrados = (
+        base_vectorial.similarity_search(
+            pregunta,
+            k=3,
+        )
+    )
+
+    contexto = "\n\n".join(
+        (
+            f"[Página "
+            f"{documento.metadata.get('page', 0) + 1}]\n"
+            f"{documento.page_content}"
+        )
+        for documento in documentos_encontrados
+    )
+
+    instrucciones = """
+Eres un agente especializado en responder preguntas sobre
+un documento académico.
+
+Debes cumplir las siguientes reglas:
+
+1. Responde únicamente utilizando el contexto proporcionado.
+2. No inventes datos.
+3. No utilices información externa al documento.
+4. Si la respuesta no aparece, responde exactamente:
+   "No encontré esa información en el documento".
+5. Responde en español.
+6. Explica la respuesta de manera clara y directa.
+7. Cuando sea posible, menciona la página correspondiente.
+"""
+
+    modelo = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        temperature=0,
+        max_retries=2,
+    )
+
+    respuesta = modelo.invoke(
+        [
+            SystemMessage(
+                content=instrucciones
+            ),
+            HumanMessage(
+                content=(
+                    f"CONTEXTO DEL DOCUMENTO:\n\n"
+                    f"{contexto}\n\n"
+                    f"PREGUNTA DEL USUARIO:\n"
+                    f"{pregunta}"
+                )
+            ),
+        ]
+    )
+
+    paginas_consultadas = sorted(
+        {
+            documento.metadata.get("page", 0) + 1
+            for documento in documentos_encontrados
+        }
+    )
+
+    return (
+        respuesta.text,
+        paginas_consultadas,
+        documentos_encontrados,
+    )
+
+
+# ---------------------------------------------------------
+# Interfaz de Streamlit
+# ---------------------------------------------------------
 
 st.set_page_config(
     page_title="Alura Agente",
@@ -50,92 +189,209 @@ st.set_page_config(
 
 st.title("🤖 Alura Agente")
 
-st.write(
-    "Procesamiento del documento: "
-    "**Marco teórico de la agenda digital**"
+
+# ---------------------------------------------------------
+# Barra lateral
+# ---------------------------------------------------------
+
+with st.sidebar:
+    st.header("Información del proyecto")
+
+    st.write(
+        "Este agente responde preguntas utilizando únicamente "
+        "el contenido del documento seleccionado."
+    )
+
+    st.subheader("Documento utilizado")
+
+    st.write(
+    "Manual de Onboarding para Nuevos Desarrolladores "
+    "de Santo Pegasus Soluciones."
 )
+
+    st.subheader("Tecnologías")
+
+    st.markdown(
+        """
+- Python
+- Streamlit
+- LangChain
+- PyPDF
+- FAISS
+- Google Gemini
+"""
+    )
+
+    st.warning(
+        "Las respuestas deben verificarse con las páginas "
+        "recuperadas del documento."
+    )
+
+
+st.write(
+    "Realiza preguntas sobre el documento "
+    "**Manual de Onboarding para Nuevos Desarrolladores**."
+)
+
+
+# ---------------------------------------------------------
+# Validaciones
+# ---------------------------------------------------------
+
+if not GOOGLE_API_KEY:
+    st.error(
+        "No se encontró GOOGLE_API_KEY. "
+        "Crea el archivo .env y agrega tu clave de Gemini."
+    )
+    st.stop()
+
 
 if not PDF_PATH.exists():
     st.error(
-        "No se encontró el PDF. Verifica que exista en:\n\n"
+        "No se encontró el PDF en la ruta:\n\n"
         f"`{PDF_PATH}`"
     )
     st.stop()
 
-try:
-    with st.spinner("Leyendo y procesando el documento..."):
-        paginas, fragmentos = procesar_documento(PDF_PATH)
 
-    total_caracteres = sum(
-        len(pagina.page_content)
-        for pagina in paginas
+# ---------------------------------------------------------
+# Ejecución principal
+# ---------------------------------------------------------
+
+try:
+    with st.spinner(
+        "Procesando el PDF y creando la base de conocimiento..."
+    ):
+        paginas, fragmentos, base_vectorial = (
+            crear_base_vectorial(
+                str(PDF_PATH),
+                PDF_PATH.stat().st_mtime,
+            )
+        )
+
+    st.success(
+        "Agente preparado correctamente."
     )
 
-    st.success("Documento procesado correctamente.")
-
-    columna_1, columna_2, columna_3 = st.columns(3)
+    columna_1, columna_2 = st.columns(2)
 
     with columna_1:
         st.metric(
-            "Páginas con texto",
+            "Páginas procesadas",
             len(paginas),
         )
 
     with columna_2:
         st.metric(
-            "Fragmentos",
+            "Fragmentos indexados",
             len(fragmentos),
         )
 
-    with columna_3:
-        st.metric(
-            "Caracteres",
-            total_caracteres,
+    st.divider()
+
+    # -----------------------------------------------------
+    # Preguntas de ejemplo
+    # -----------------------------------------------------
+
+    st.subheader("Preguntas de ejemplo")
+
+    st.info(
+    """
+- ¿Qué tecnologías utiliza el equipo de back-end?
+- ¿Qué accesos debe recibir una persona durante el primer día?
+- ¿Cuál es el flujo de trabajo de Git utilizado por la empresa?
+- ¿Qué requisitos debe cumplir un Pull Request antes del merge?
+- ¿Cuáles son los beneficios disponibles para los empleados?
+"""
+)
+    # -----------------------------------------------------
+    # Formulario
+    # -----------------------------------------------------
+
+    with st.form("formulario_pregunta"):
+        pregunta = st.text_area(
+            "Escribe una pregunta sobre el documento",
+            placeholder=(
+    "¿Qué accesos debe recibir un desarrollador "
+    "durante su primer día?"
+),
+            height=100,
         )
 
-    st.subheader("Contenido de una página")
+        consultar = st.form_submit_button(
+            "Consultar documento",
+            type="primary",
+        )
 
-    numero_pagina = st.selectbox(
-        "Selecciona una página",
-        options=range(1, len(paginas) + 1),
-    )
+    # -----------------------------------------------------
+    # Mostrar respuesta
+    # -----------------------------------------------------
 
-    pagina_seleccionada = paginas[numero_pagina - 1]
+    if consultar:
+        if not pregunta.strip():
+            st.warning(
+                "Debes escribir una pregunta."
+            )
+        else:
+            with st.spinner(
+                "Buscando información en el documento..."
+            ):
+                (
+                    respuesta,
+                    paginas_usadas,
+                    documentos_usados,
+                ) = responder_pregunta(
+                    pregunta.strip(),
+                    base_vectorial,
+                )
 
-    st.text_area(
-        "Texto extraído",
-        value=pagina_seleccionada.page_content,
-        height=300,
-        disabled=True,
-    )
+            st.subheader("Respuesta")
 
-    st.subheader("Ejemplo de fragmento")
+            st.write(respuesta)
 
-    numero_fragmento = st.selectbox(
-        "Selecciona un fragmento",
-        options=range(1, len(fragmentos) + 1),
-    )
+            st.caption(
+                "Páginas recuperadas: "
+                + ", ".join(
+                    str(pagina)
+                    for pagina in paginas_usadas
+                )
+            )
 
-    fragmento_seleccionado = fragmentos[
-        numero_fragmento - 1
-    ]
+            with st.expander(
+                "Ver fragmentos utilizados"
+            ):
+                for posicion, documento in enumerate(
+                    documentos_usados,
+                    start=1,
+                ):
+                    pagina = (
+                        documento.metadata.get("page", 0)
+                        + 1
+                    )
 
-    pagina_original = (
-        fragmento_seleccionado.metadata.get("page", 0) + 1
-    )
+                    st.markdown(
+                        f"### Fragmento {posicion} "
+                        f"— página {pagina}"
+                    )
+
+                    st.write(
+                        documento.page_content
+                    )
+
+                    st.divider()
+
+    # -----------------------------------------------------
+    # Pie de página
+    # -----------------------------------------------------
+
+    st.divider()
 
     st.caption(
-        f"Fragmento obtenido de la página {pagina_original}"
-    )
-
-    st.text_area(
-        "Contenido del fragmento",
-        value=fragmento_seleccionado.page_content,
-        height=250,
-        disabled=True,
+        "Proyecto desarrollado para el desafío final "
+        "Alura Agente."
     )
 
 except Exception as error:
     st.error(
-        f"No se pudo procesar el documento: {error}"
+        f"No se pudo ejecutar el agente: {error}"
     )
