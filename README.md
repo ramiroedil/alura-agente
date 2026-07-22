@@ -254,17 +254,22 @@ __pycache__/
 documentos/manual_onboarding_desarrolladores.pdf
 ```
 
+
+Reemplázala por:
+
+```markdown
 ## ☁️ Despliegue en OCI
 
-La aplicación será desplegada en una instancia de Oracle Cloud Infrastructure Compute.
+La aplicación fue desplegada en una instancia Compute de Oracle Cloud
+Infrastructure, en la región Chile Central (Santiago).
 
-Estado del despliegue:
+### Enlace público
 
-```text
-Pendiente
-```
+http://144.22.35.27:8501
 
-Cuando el despliegue esté terminado, se agregará aquí el enlace público o una captura de la aplicación funcionando en OCI.
+### Evidencia del despliegue
+
+![Aplicación desplegada en OCI](capturas/despliegue_oci.png)
 
 ## 👤 Autor
 
